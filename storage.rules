@@ -1,0 +1,55 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isProjectMember(projectId) {
+      return isAuthenticated() && 
+             firestore.exists(/databases/(default)/documents/projects/$(projectId)) &&
+             firestore.get(/databases/(default)/documents/projects/$(projectId))
+               .data.teamMembers.hasAny([{userId: request.auth.uid}]);
+    }
+    
+    match /projects/{projectId}/documents/{allPaths=**} {
+      allow read: if isProjectMember(projectId);
+      allow write: if isProjectMember(projectId) && 
+                     request.resource.size < 50 * 1024 * 1024;
+      allow delete: if isProjectMember(projectId);
+    }
+    
+    match /projects/{projectId}/marketing/{allPaths=**} {
+      allow read: if isProjectMember(projectId);
+      allow write: if isProjectMember(projectId) && 
+                     request.resource.size < 10 * 1024 * 1024 &&
+                     request.resource.contentType.matches('image/.*');
+      allow delete: if isProjectMember(projectId);
+    }
+    
+    match /users/{userId}/profile/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId) && 
+                     request.resource.size < 5 * 1024 * 1024 &&
+                     request.resource.contentType.matches('image/.*');
+      allow delete: if isOwner(userId);
+    }
+    
+    match /equipment/{equipmentId}/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && 
+                     request.resource.size < 5 * 1024 * 1024 &&
+                     request.resource.contentType.matches('image/.*');
+      allow delete: if isAuthenticated();
+    }
+    
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
