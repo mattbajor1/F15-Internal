@@ -99,9 +99,9 @@ app.get('/api/dashboard', authMiddleware, async (req: Request, res: Response): P
     const availableEquipment = equipmentSnapshot.docs.filter(
       (doc) => doc.data().status === 'Available'
     ).length;
-    const equipmentAvailability = totalEquipment > 0 ?
-      Math.round((availableEquipment / totalEquipment) * 100) :
-      100;
+    const equipmentAvailability = totalEquipment > 0
+      ? Math.round((availableEquipment / totalEquipment) * 100)
+      : 0;
 
     const recentProjects = projectsSnapshot.docs
       .sort((a, b) => {
