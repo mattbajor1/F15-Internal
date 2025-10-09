@@ -44,69 +44,87 @@ const v2_1 = require("firebase-functions/v2");
 const admin = __importStar(require("firebase-admin"));
 const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
-// Set global options for all functions
+const cookie_parser_1 = __importDefault(require("cookie-parser"));
+// ---------- Functions config ----------
 (0, v2_1.setGlobalOptions)({ maxInstances: 10 });
 admin.initializeApp();
 const db = admin.firestore();
 const storage = admin.storage();
+// ---------- App + middleware ----------
 const app = (0, express_1.default)();
-app.use((0, cors_1.default)({ origin: true }));
+// Allow credentialed CORS (cookies)
+app.use((0, cors_1.default)({ origin: true, credentials: true }));
+app.use((0, cookie_parser_1.default)());
 app.use(express_1.default.json());
-app.use((req, res, next) => {
-    var _a;
+app.options('*', (0, cors_1.default)({ origin: true, credentials: true })); // preflight
+// Request logging (useful during dev)
+app.use((req, _res, next) => {
     console.log(`${req.method} ${req.path}`, {
-        body: req.body,
-        user: (_a = req.user) === null || _a === void 0 ? void 0 : _a.uid,
+        hasBody: !!req.body && Object.keys(req.body).length > 0,
     });
     next();
 });
+/** ---------- AUTH ---------- */
 const authMiddleware = async (req, res, next) => {
+    var _a;
     try {
+        // 1) Try Firebase session cookie
+        const sessionCookie = (_a = req.cookies) === null || _a === void 0 ? void 0 : _a.__session;
+        if (sessionCookie) {
+            const decoded = await admin.auth().verifySessionCookie(sessionCookie, true);
+            req.user = { uid: decoded.uid, email: decoded.email };
+            return next();
+        }
+        // 2) Fallback to Bearer token
         const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            res.status(401).json({ error: 'Unauthorized: No token provided' });
+        if (!(authHeader === null || authHeader === void 0 ? void 0 : authHeader.startsWith('Bearer '))) {
+            res.status(401).json({ error: 'Unauthorized: No session or token' });
             return;
         }
-        const token = authHeader.split('Bearer ')[1];
-        const decodedToken = await admin.auth().verifyIdToken(token);
-        req.user = {
-            uid: decodedToken.uid,
-            email: decodedToken.email,
-        };
+        const token = authHeader.slice('Bearer '.length);
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.user = { uid: decoded.uid, email: decoded.email };
         next();
     }
-    catch (error) {
-        console.error('Auth error:', error);
-        res.status(401).json({ error: 'Unauthorized: Invalid token' });
+    catch (err) {
+        console.error('Auth error:', err);
+        res.status(401).json({ error: 'Unauthorized: Invalid auth' });
     }
 };
 exports.authMiddleware = authMiddleware;
+// Membership helpers (used by routes)
 async function isProjectMember(projectId, userId) {
-    var _a;
     const projectDoc = await db.collection('projects').doc(projectId).get();
     if (!projectDoc.exists)
         return false;
     const data = projectDoc.data();
-    return ((_a = data.teamMembers) === null || _a === void 0 ? void 0 : _a.some((member) => member.userId === userId)) || false;
+    if (Array.isArray(data === null || data === void 0 ? void 0 : data.teamMemberIds))
+        return data.teamMemberIds.includes(userId);
+    return Array.isArray(data === null || data === void 0 ? void 0 : data.teamMembers)
+        ? data.teamMembers.some((m) => (m === null || m === void 0 ? void 0 : m.userId) === userId)
+        : false;
 }
 async function isProjectOwner(projectId, userId) {
     const projectDoc = await db.collection('projects').doc(projectId).get();
     if (!projectDoc.exists)
         return false;
     const data = projectDoc.data();
-    return data.ownerId === userId;
+    return (data === null || data === void 0 ? void 0 : data.ownerId) === userId;
 }
-app.get('/api/dashboard', exports.authMiddleware, async (req, res) => {
+/** ---------- DASHBOARD ---------- */
+app.get('/dashboard', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
-        const projectsSnapshot = await db.collection('projects')
-            .where('teamMembers', 'array-contains-any', [{ userId: uid }])
+        const projectsSnapshot = await db
+            .collection('projects')
+            .where('teamMemberIds', 'array-contains', uid)
             .get();
         const projectIds = projectsSnapshot.docs.map((doc) => doc.id);
         const activeProjects = projectsSnapshot.docs.filter((doc) => doc.data().status === 'active').length;
         let openTasks = 0;
         for (const projectId of projectIds) {
-            const tasksSnapshot = await db.collection('projects')
+            const tasksSnapshot = await db
+                .collection('projects')
                 .doc(projectId)
                 .collection('tasks')
                 .where('completed', '==', false)
@@ -116,24 +134,18 @@ app.get('/api/dashboard', exports.authMiddleware, async (req, res) => {
         const equipmentSnapshot = await db.collection('equipment').get();
         const totalEquipment = equipmentSnapshot.size;
         const availableEquipment = equipmentSnapshot.docs.filter((doc) => doc.data().status === 'Available').length;
-        const equipmentAvailability = totalEquipment > 0 ?
-            Math.round((availableEquipment / totalEquipment) * 100) :
-            100;
+        const equipmentAvailability = totalEquipment > 0 ? Math.round((availableEquipment / totalEquipment) * 100) : 0;
         const recentProjects = projectsSnapshot.docs
             .sort((a, b) => {
-            var _a, _b;
-            const aDate = ((_a = a.data().updatedAt) === null || _a === void 0 ? void 0 : _a.toDate()) || new Date(0);
-            const bDate = ((_b = b.data().updatedAt) === null || _b === void 0 ? void 0 : _b.toDate()) || new Date(0);
+            var _a, _b, _c, _d;
+            const aDate = ((_b = (_a = a.data().updatedAt) === null || _a === void 0 ? void 0 : _a.toDate) === null || _b === void 0 ? void 0 : _b.call(_a)) || new Date(0);
+            const bDate = ((_d = (_c = b.data().updatedAt) === null || _c === void 0 ? void 0 : _c.toDate) === null || _d === void 0 ? void 0 : _d.call(_c)) || new Date(0);
             return bDate.getTime() - aDate.getTime();
         })
             .slice(0, 5)
             .map((doc) => (Object.assign({ id: doc.id }, doc.data())));
         res.json({
-            metrics: {
-                activeProjects,
-                openTasks,
-                equipmentAvailability,
-            },
+            metrics: { activeProjects, openTasks, equipmentAvailability },
             recentProjects,
         });
     }
@@ -142,11 +154,13 @@ app.get('/api/dashboard', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/projects', exports.authMiddleware, async (req, res) => {
+/** ---------- PROJECTS ---------- */
+app.get('/projects', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
-        const projectsSnapshot = await db.collection('projects')
-            .where('teamMembers', 'array-contains-any', [{ userId: uid }])
+        const projectsSnapshot = await db
+            .collection('projects')
+            .where('teamMemberIds', 'array-contains', uid)
             .orderBy('createdAt', 'desc')
             .get();
         const projects = projectsSnapshot.docs.map((doc) => (Object.assign({ id: doc.id }, doc.data())));
@@ -157,10 +171,10 @@ app.get('/api/projects', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects', exports.authMiddleware, async (req, res) => {
+app.post('/projects', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
-        const { name, description, status, startDate, endDate, locations } = req.body;
+        const { name, description, status, startDate, endDate, locations } = req.body || {};
         if (!name) {
             res.status(400).json({ error: 'Project name is required' });
             return;
@@ -175,12 +189,15 @@ app.post('/api/projects', exports.authMiddleware, async (req, res) => {
             endDate: endDate || null,
             locations: locations || [],
             ownerId: uid,
-            teamMembers: [{
+            teamMembers: [
+                {
                     userId: uid,
                     role: 'Owner',
                     name: (userData === null || userData === void 0 ? void 0 : userData.displayName) || (userData === null || userData === void 0 ? void 0 : userData.email) || 'Unknown',
                     avatar: (userData === null || userData === void 0 ? void 0 : userData.photoURL) || null,
-                }],
+                },
+            ],
+            teamMemberIds: [uid], // for queries
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
@@ -192,11 +209,11 @@ app.post('/api/projects', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/projects/:id', exports.authMiddleware, async (req, res) => {
+app.get('/projects/:id', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
@@ -212,17 +229,20 @@ app.get('/api/projects/:id', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.patch('/api/projects/:id', exports.authMiddleware, async (req, res) => {
+app.patch('/projects/:id', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        if (!await isProjectOwner(projectId, uid)) {
+        if (!(await isProjectOwner(projectId, uid))) {
             res.status(403).json({ error: 'Only project owner can update' });
             return;
         }
-        const updates = req.body;
+        const updates = Object.assign({}, (req.body || {}));
         delete updates.ownerId;
         delete updates.createdAt;
+        if (Array.isArray(updates.teamMembers)) {
+            updates.teamMemberIds = updates.teamMembers.map((m) => m === null || m === void 0 ? void 0 : m.userId).filter(Boolean);
+        }
         updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
         await db.collection('projects').doc(projectId).update(updates);
         res.json({ success: true });
@@ -232,24 +252,19 @@ app.patch('/api/projects/:id', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.delete('/api/projects/:id', exports.authMiddleware, async (req, res) => {
+app.delete('/projects/:id', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        if (!await isProjectOwner(projectId, uid)) {
+        if (!(await isProjectOwner(projectId, uid))) {
             res.status(403).json({ error: 'Only project owner can delete' });
             return;
         }
         const batch = db.batch();
         const collections = ['tasks', 'equipment', 'marketing', 'invoices', 'documents'];
         for (const collectionName of collections) {
-            const snapshot = await db.collection('projects')
-                .doc(projectId)
-                .collection(collectionName)
-                .get();
-            snapshot.docs.forEach((doc) => {
-                batch.delete(doc.ref);
-            });
+            const snapshot = await db.collection('projects').doc(projectId).collection(collectionName).get();
+            snapshot.docs.forEach((doc) => batch.delete(doc.ref));
         }
         batch.delete(db.collection('projects').doc(projectId));
         await batch.commit();
@@ -260,25 +275,29 @@ app.delete('/api/projects/:id', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects/:id/team', exports.authMiddleware, async (req, res) => {
-    var _a;
+app.post('/projects/:id/team', exports.authMiddleware, async (req, res) => {
+    var _a, _b;
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        const { userId, role, name, avatar } = req.body;
-        if (!await isProjectOwner(projectId, uid)) {
+        const { userId, role, name, avatar } = req.body || {};
+        if (!(await isProjectOwner(projectId, uid))) {
             res.status(403).json({ error: 'Only project owner can add members' });
             return;
         }
-        const projectDoc = await db.collection('projects').doc(projectId).get();
-        const teamMembers = ((_a = projectDoc.data()) === null || _a === void 0 ? void 0 : _a.teamMembers) || [];
-        if (teamMembers.some((m) => m.userId === userId)) {
+        const projectRef = db.collection('projects').doc(projectId);
+        const projectDoc = await projectRef.get();
+        const teamMembers = (((_a = projectDoc.data()) === null || _a === void 0 ? void 0 : _a.teamMembers) || []);
+        const teamMemberIds = (((_b = projectDoc.data()) === null || _b === void 0 ? void 0 : _b.teamMemberIds) || []);
+        if (teamMembers.some((m) => (m === null || m === void 0 ? void 0 : m.userId) === userId)) {
             res.status(400).json({ error: 'User already in team' });
             return;
         }
         teamMembers.push({ userId, role, name, avatar: avatar || null });
-        await db.collection('projects').doc(projectId).update({
+        teamMemberIds.push(userId);
+        await projectRef.update({
             teamMembers,
+            teamMemberIds,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
         res.json({ success: true });
@@ -288,26 +307,28 @@ app.post('/api/projects/:id/team', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.delete('/api/projects/:id/team/:userId', exports.authMiddleware, async (req, res) => {
-    var _a, _b;
+app.delete('/projects/:id/team/:userId', exports.authMiddleware, async (req, res) => {
+    var _a, _b, _c;
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
         const userIdToRemove = req.params.userId;
-        if (!await isProjectOwner(projectId, uid)) {
+        if (!(await isProjectOwner(projectId, uid))) {
             res.status(403).json({ error: 'Only project owner can remove members' });
             return;
         }
-        const projectDoc = await db.collection('projects').doc(projectId).get();
+        const projectRef = db.collection('projects').doc(projectId);
+        const projectDoc = await projectRef.get();
         const ownerId = (_a = projectDoc.data()) === null || _a === void 0 ? void 0 : _a.ownerId;
         if (userIdToRemove === ownerId) {
             res.status(400).json({ error: 'Cannot remove project owner' });
             return;
         }
-        const teamMembers = ((_b = projectDoc.data()) === null || _b === void 0 ? void 0 : _b.teamMembers) || [];
-        const updatedTeam = teamMembers.filter((m) => m.userId !== userIdToRemove);
-        await db.collection('projects').doc(projectId).update({
-            teamMembers: updatedTeam,
+        const teamMembers = (((_b = projectDoc.data()) === null || _b === void 0 ? void 0 : _b.teamMembers) || []).filter((m) => (m === null || m === void 0 ? void 0 : m.userId) !== userIdToRemove);
+        const teamMemberIds = (((_c = projectDoc.data()) === null || _c === void 0 ? void 0 : _c.teamMemberIds) || []).filter((id) => id !== userIdToRemove);
+        await projectRef.update({
+            teamMembers,
+            teamMemberIds,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
         res.json({ success: true });
@@ -317,15 +338,17 @@ app.delete('/api/projects/:id/team/:userId', exports.authMiddleware, async (req,
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/projects/:id/tasks', exports.authMiddleware, async (req, res) => {
+/** ---------- TASKS ---------- */
+app.get('/projects/:id/tasks', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const tasksSnapshot = await db.collection('projects')
+        const tasksSnapshot = await db
+            .collection('projects')
             .doc(projectId)
             .collection('tasks')
             .orderBy('dueDate', 'asc')
@@ -338,12 +361,12 @@ app.get('/api/projects/:id/tasks', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects/:id/tasks', exports.authMiddleware, async (req, res) => {
+app.post('/projects/:id/tasks', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        const { title, description, stage, dueDate, assignedTo } = req.body;
-        if (!await isProjectMember(projectId, uid)) {
+        const { title, description, stage, dueDate, assignedTo } = req.body || {};
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
@@ -361,10 +384,7 @@ app.post('/api/projects/:id/tasks', exports.authMiddleware, async (req, res) => 
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
-        const docRef = await db.collection('projects')
-            .doc(projectId)
-            .collection('tasks')
-            .add(newTask);
+        const docRef = await db.collection('projects').doc(projectId).collection('tasks').add(newTask);
         res.status(201).json(Object.assign(Object.assign({ id: docRef.id }, newTask), { createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
     }
     catch (error) {
@@ -372,21 +392,17 @@ app.post('/api/projects/:id/tasks', exports.authMiddleware, async (req, res) => 
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.patch('/api/projects/:projectId/tasks/:taskId', exports.authMiddleware, async (req, res) => {
+app.patch('/projects/:projectId/tasks/:taskId', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const { projectId, taskId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const updates = req.body;
+        const updates = Object.assign({}, (req.body || {}));
         updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('tasks')
-            .doc(taskId)
-            .update(updates);
+        await db.collection('projects').doc(projectId).collection('tasks').doc(taskId).update(updates);
         res.json({ success: true });
     }
     catch (error) {
@@ -394,19 +410,15 @@ app.patch('/api/projects/:projectId/tasks/:taskId', exports.authMiddleware, asyn
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.delete('/api/projects/:projectId/tasks/:taskId', exports.authMiddleware, async (req, res) => {
+app.delete('/projects/:projectId/tasks/:taskId', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const { projectId, taskId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('tasks')
-            .doc(taskId)
-            .delete();
+        await db.collection('projects').doc(projectId).collection('tasks').doc(taskId).delete();
         res.json({ success: true });
     }
     catch (error) {
@@ -414,19 +426,17 @@ app.delete('/api/projects/:projectId/tasks/:taskId', exports.authMiddleware, asy
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/projects/:id/equipment', exports.authMiddleware, async (req, res) => {
+/** ---------- EQUIPMENT (per project + global) ---------- */
+app.get('/projects/:id/equipment', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const equipmentSnapshot = await db.collection('projects')
-            .doc(projectId)
-            .collection('equipment')
-            .get();
-        const equipment = equipmentSnapshot.docs.map((doc) => (Object.assign({ id: doc.id }, doc.data())));
+        const snap = await db.collection('projects').doc(projectId).collection('equipment').get();
+        const equipment = snap.docs.map((d) => (Object.assign({ id: d.id }, d.data())));
         res.json({ equipment });
     }
     catch (error) {
@@ -434,12 +444,12 @@ app.get('/api/projects/:id/equipment', exports.authMiddleware, async (req, res) 
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects/:id/equipment', exports.authMiddleware, async (req, res) => {
+app.post('/projects/:id/equipment', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        const { equipmentId, rentalPrice, notes } = req.body;
-        if (!await isProjectMember(projectId, uid)) {
+        const { equipmentId, rentalPrice, notes } = req.body || {};
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
@@ -457,10 +467,7 @@ app.post('/api/projects/:id/equipment', exports.authMiddleware, async (req, res)
             notes: notes || '',
             assignedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
-        const docRef = await db.collection('projects')
-            .doc(projectId)
-            .collection('equipment')
-            .add(assignment);
+        const docRef = await db.collection('projects').doc(projectId).collection('equipment').add(assignment);
         await db.collection('equipment').doc(equipmentId).update({
             status: 'In Use',
             currentProjectId: projectId,
@@ -472,20 +479,16 @@ app.post('/api/projects/:id/equipment', exports.authMiddleware, async (req, res)
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.delete('/api/projects/:projectId/equipment/:assignmentId', exports.authMiddleware, async (req, res) => {
+app.delete('/projects/:projectId/equipment/:assignmentId', exports.authMiddleware, async (req, res) => {
     var _a;
     try {
         const uid = req.user.uid;
         const { projectId, assignmentId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const assignmentDoc = await db.collection('projects')
-            .doc(projectId)
-            .collection('equipment')
-            .doc(assignmentId)
-            .get();
+        const assignmentDoc = await db.collection('projects').doc(projectId).collection('equipment').doc(assignmentId).get();
         if (assignmentDoc.exists) {
             const equipmentId = (_a = assignmentDoc.data()) === null || _a === void 0 ? void 0 : _a.equipmentId;
             await db.collection('equipment').doc(equipmentId).update({
@@ -493,11 +496,7 @@ app.delete('/api/projects/:projectId/equipment/:assignmentId', exports.authMiddl
                 currentProjectId: null,
             });
         }
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('equipment')
-            .doc(assignmentId)
-            .delete();
+        await db.collection('projects').doc(projectId).collection('equipment').doc(assignmentId).delete();
         res.json({ success: true });
     }
     catch (error) {
@@ -505,15 +504,17 @@ app.delete('/api/projects/:projectId/equipment/:assignmentId', exports.authMiddl
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/projects/:id/marketing', exports.authMiddleware, async (req, res) => {
+/** ---------- MARKETING ---------- */
+app.get('/projects/:id/marketing', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const marketingSnapshot = await db.collection('projects')
+        const marketingSnapshot = await db
+            .collection('projects')
             .doc(projectId)
             .collection('marketing')
             .orderBy('scheduledDate', 'desc')
@@ -526,16 +527,16 @@ app.get('/api/projects/:id/marketing', exports.authMiddleware, async (req, res) 
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects/:id/marketing', exports.authMiddleware, async (req, res) => {
+app.post('/projects/:id/marketing', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        const { copy, platforms, status, scheduledDate, imageUrl } = req.body;
-        if (!await isProjectMember(projectId, uid)) {
+        const { copy, platforms, status, scheduledDate, imageUrl } = req.body || {};
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        if (!copy || !platforms || platforms.length === 0) {
+        if (!copy || !Array.isArray(platforms) || platforms.length === 0) {
             res.status(400).json({ error: 'Copy and platforms are required' });
             return;
         }
@@ -549,10 +550,7 @@ app.post('/api/projects/:id/marketing', exports.authMiddleware, async (req, res)
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
-        const docRef = await db.collection('projects')
-            .doc(projectId)
-            .collection('marketing')
-            .add(newContent);
+        const docRef = await db.collection('projects').doc(projectId).collection('marketing').add(newContent);
         res.status(201).json(Object.assign(Object.assign({ id: docRef.id }, newContent), { createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
     }
     catch (error) {
@@ -560,21 +558,16 @@ app.post('/api/projects/:id/marketing', exports.authMiddleware, async (req, res)
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.patch('/api/projects/:projectId/marketing/:marketingId', exports.authMiddleware, async (req, res) => {
+app.patch('/projects/:projectId/marketing/:marketingId', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const { projectId, marketingId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const updates = req.body;
-        updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('marketing')
-            .doc(marketingId)
-            .update(updates);
+        const updates = Object.assign(Object.assign({}, (req.body || {})), { updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        await db.collection('projects').doc(projectId).collection('marketing').doc(marketingId).update(updates);
         res.json({ success: true });
     }
     catch (error) {
@@ -582,19 +575,15 @@ app.patch('/api/projects/:projectId/marketing/:marketingId', exports.authMiddlew
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.delete('/api/projects/:projectId/marketing/:marketingId', exports.authMiddleware, async (req, res) => {
+app.delete('/projects/:projectId/marketing/:marketingId', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const { projectId, marketingId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('marketing')
-            .doc(marketingId)
-            .delete();
+        await db.collection('projects').doc(projectId).collection('marketing').doc(marketingId).delete();
         res.json({ success: true });
     }
     catch (error) {
@@ -602,12 +591,12 @@ app.delete('/api/projects/:projectId/marketing/:marketingId', exports.authMiddle
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects/:id/marketing/generate', exports.authMiddleware, async (req, res) => {
+app.post('/projects/:id/marketing/generate', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        const { projectDetails, targetAudience, campaignGoals, tone } = req.body;
-        if (!await isProjectMember(projectId, uid)) {
+        const { projectDetails, targetAudience, campaignGoals, tone } = req.body || {};
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
@@ -631,15 +620,17 @@ app.post('/api/projects/:id/marketing/generate', exports.authMiddleware, async (
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/projects/:id/invoices', exports.authMiddleware, async (req, res) => {
+/** ---------- INVOICES ---------- */
+app.get('/projects/:id/invoices', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const invoicesSnapshot = await db.collection('projects')
+        const invoicesSnapshot = await db
+            .collection('projects')
             .doc(projectId)
             .collection('invoices')
             .orderBy('dueDate', 'desc')
@@ -652,12 +643,12 @@ app.get('/api/projects/:id/invoices', exports.authMiddleware, async (req, res) =
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects/:id/invoices', exports.authMiddleware, async (req, res) => {
+app.post('/projects/:id/invoices', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        const { invoiceNumber, clientName, amount, status, dueDate, items } = req.body;
-        if (!await isProjectMember(projectId, uid)) {
+        const { invoiceNumber, clientName, amount, status, dueDate, items } = req.body || {};
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
@@ -676,10 +667,7 @@ app.post('/api/projects/:id/invoices', exports.authMiddleware, async (req, res) 
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
-        const docRef = await db.collection('projects')
-            .doc(projectId)
-            .collection('invoices')
-            .add(newInvoice);
+        const docRef = await db.collection('projects').doc(projectId).collection('invoices').add(newInvoice);
         res.status(201).json(Object.assign(Object.assign({ id: docRef.id }, newInvoice), { createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
     }
     catch (error) {
@@ -687,21 +675,16 @@ app.post('/api/projects/:id/invoices', exports.authMiddleware, async (req, res) 
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.patch('/api/projects/:projectId/invoices/:invoiceId', exports.authMiddleware, async (req, res) => {
+app.patch('/projects/:projectId/invoices/:invoiceId', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const { projectId, invoiceId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const updates = req.body;
-        updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('invoices')
-            .doc(invoiceId)
-            .update(updates);
+        const updates = Object.assign(Object.assign({}, (req.body || {})), { updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        await db.collection('projects').doc(projectId).collection('invoices').doc(invoiceId).update(updates);
         res.json({ success: true });
     }
     catch (error) {
@@ -709,19 +692,15 @@ app.patch('/api/projects/:projectId/invoices/:invoiceId', exports.authMiddleware
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.delete('/api/projects/:projectId/invoices/:invoiceId', exports.authMiddleware, async (req, res) => {
+app.delete('/projects/:projectId/invoices/:invoiceId', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const { projectId, invoiceId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('invoices')
-            .doc(invoiceId)
-            .delete();
+        await db.collection('projects').doc(projectId).collection('invoices').doc(invoiceId).delete();
         res.json({ success: true });
     }
     catch (error) {
@@ -729,15 +708,17 @@ app.delete('/api/projects/:projectId/invoices/:invoiceId', exports.authMiddlewar
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/projects/:id/documents', exports.authMiddleware, async (req, res) => {
+/** ---------- DOCUMENTS ---------- */
+app.get('/projects/:id/documents', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const documentsSnapshot = await db.collection('projects')
+        const documentsSnapshot = await db
+            .collection('projects')
             .doc(projectId)
             .collection('documents')
             .orderBy('uploadedAt', 'desc')
@@ -750,12 +731,12 @@ app.get('/api/projects/:id/documents', exports.authMiddleware, async (req, res) 
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects/:id/documents', exports.authMiddleware, async (req, res) => {
+app.post('/projects/:id/documents', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        const { name, fileUrl, fileSize, mimeType, version, accessPermissions } = req.body;
-        if (!await isProjectMember(projectId, uid)) {
+        const { name, fileUrl, fileSize, mimeType, version, accessPermissions } = req.body || {};
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
@@ -774,10 +755,7 @@ app.post('/api/projects/:id/documents', exports.authMiddleware, async (req, res)
             uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
-        const docRef = await db.collection('projects')
-            .doc(projectId)
-            .collection('documents')
-            .add(newDocument);
+        const docRef = await db.collection('projects').doc(projectId).collection('documents').add(newDocument);
         res.status(201).json(Object.assign(Object.assign({ id: docRef.id }, newDocument), { uploadedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
     }
     catch (error) {
@@ -785,21 +763,16 @@ app.post('/api/projects/:id/documents', exports.authMiddleware, async (req, res)
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.patch('/api/projects/:projectId/documents/:documentId', exports.authMiddleware, async (req, res) => {
+app.patch('/projects/:projectId/documents/:documentId', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const { projectId, documentId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const updates = req.body;
-        updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('documents')
-            .doc(documentId)
-            .update(updates);
+        const updates = Object.assign(Object.assign({}, (req.body || {})), { updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        await db.collection('projects').doc(projectId).collection('documents').doc(documentId).update(updates);
         res.json({ success: true });
     }
     catch (error) {
@@ -807,20 +780,16 @@ app.patch('/api/projects/:projectId/documents/:documentId', exports.authMiddlewa
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.delete('/api/projects/:projectId/documents/:documentId', exports.authMiddleware, async (req, res) => {
+app.delete('/projects/:projectId/documents/:documentId', exports.authMiddleware, async (req, res) => {
     var _a;
     try {
         const uid = req.user.uid;
         const { projectId, documentId } = req.params;
-        if (!await isProjectMember(projectId, uid)) {
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
-        const docSnapshot = await db.collection('projects')
-            .doc(projectId)
-            .collection('documents')
-            .doc(documentId)
-            .get();
+        const docSnapshot = await db.collection('projects').doc(projectId).collection('documents').doc(documentId).get();
         if (docSnapshot.exists) {
             const fileUrl = (_a = docSnapshot.data()) === null || _a === void 0 ? void 0 : _a.fileUrl;
             if (fileUrl && fileUrl.includes('firebasestorage.googleapis.com')) {
@@ -836,11 +805,7 @@ app.delete('/api/projects/:projectId/documents/:documentId', exports.authMiddlew
                 }
             }
         }
-        await db.collection('projects')
-            .doc(projectId)
-            .collection('documents')
-            .doc(documentId)
-            .delete();
+        await db.collection('projects').doc(projectId).collection('documents').doc(documentId).delete();
         res.json({ success: true });
     }
     catch (error) {
@@ -848,12 +813,12 @@ app.delete('/api/projects/:projectId/documents/:documentId', exports.authMiddlew
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/projects/:id/documents/upload-url', exports.authMiddleware, async (req, res) => {
+app.post('/projects/:id/documents/upload-url', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const projectId = req.params.id;
-        const { fileName, contentType } = req.body;
-        if (!await isProjectMember(projectId, uid)) {
+        const { fileName, contentType } = req.body || {};
+        if (!(await isProjectMember(projectId, uid))) {
             res.status(403).json({ error: 'Access denied' });
             return;
         }
@@ -878,11 +843,10 @@ app.post('/api/projects/:id/documents/upload-url', exports.authMiddleware, async
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/equipment', exports.authMiddleware, async (req, res) => {
+/** ---------- GLOBAL EQUIPMENT ---------- */
+app.get('/equipment', exports.authMiddleware, async (_req, res) => {
     try {
-        const equipmentSnapshot = await db.collection('equipment')
-            .orderBy('name', 'asc')
-            .get();
+        const equipmentSnapshot = await db.collection('equipment').orderBy('name', 'asc').get();
         const equipment = equipmentSnapshot.docs.map((doc) => (Object.assign({ id: doc.id }, doc.data())));
         res.json({ equipment });
     }
@@ -891,7 +855,7 @@ app.get('/api/equipment', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/equipment/:id', exports.authMiddleware, async (req, res) => {
+app.get('/equipment/:id', exports.authMiddleware, async (req, res) => {
     try {
         const equipmentDoc = await db.collection('equipment').doc(req.params.id).get();
         if (!equipmentDoc.exists) {
@@ -905,9 +869,9 @@ app.get('/api/equipment/:id', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/equipment', exports.authMiddleware, async (req, res) => {
+app.post('/equipment', exports.authMiddleware, async (req, res) => {
     try {
-        const { name, category, status, nextMaintenance, purchaseDate, purchasePrice } = req.body;
+        const { name, category, status, nextMaintenance, purchaseDate, purchasePrice } = req.body || {};
         if (!name || !category) {
             res.status(400).json({ error: 'Name and category are required' });
             return;
@@ -931,10 +895,9 @@ app.post('/api/equipment', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.patch('/api/equipment/:id', exports.authMiddleware, async (req, res) => {
+app.patch('/equipment/:id', exports.authMiddleware, async (req, res) => {
     try {
-        const updates = req.body;
-        updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+        const updates = Object.assign(Object.assign({}, (req.body || {})), { updatedAt: admin.firestore.FieldValue.serverTimestamp() });
         await db.collection('equipment').doc(req.params.id).update(updates);
         res.json({ success: true });
     }
@@ -943,7 +906,7 @@ app.patch('/api/equipment/:id', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.delete('/api/equipment/:id', exports.authMiddleware, async (req, res) => {
+app.delete('/equipment/:id', exports.authMiddleware, async (req, res) => {
     try {
         await db.collection('equipment').doc(req.params.id).delete();
         res.json({ success: true });
@@ -953,7 +916,8 @@ app.delete('/api/equipment/:id', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/me', exports.authMiddleware, async (req, res) => {
+/** ---------- PROFILE ---------- */
+app.get('/me', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
         const userDoc = await db.collection('users').doc(uid).get();
@@ -968,10 +932,10 @@ app.get('/api/me', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.patch('/api/me', exports.authMiddleware, async (req, res) => {
+app.patch('/me', exports.authMiddleware, async (req, res) => {
     try {
         const uid = req.user.uid;
-        const updates = req.body;
+        const updates = Object.assign({}, (req.body || {}));
         delete updates.email;
         updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
         await db.collection('users').doc(uid).set(updates, { merge: true });
@@ -982,17 +946,15 @@ app.patch('/api/me', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/api/users/search', exports.authMiddleware, async (req, res) => {
+app.get('/users/search', exports.authMiddleware, async (req, res) => {
+    var _a;
     try {
-        const query = (req.query.q || '').toLowerCase();
-        if (!query || query.length < 2) {
+        const q = ((_a = req.query.q) === null || _a === void 0 ? void 0 : _a.toLowerCase()) || '';
+        if (q.length < 2) {
             res.status(400).json({ error: 'Query must be at least 2 characters' });
             return;
         }
-        const usersSnapshot = await db.collection('users')
-            .orderBy('email')
-            .limit(20)
-            .get();
+        const usersSnapshot = await db.collection('users').orderBy('email').limit(20).get();
         const users = usersSnapshot.docs
             .map((doc) => ({
             id: doc.id,
@@ -1000,10 +962,10 @@ app.get('/api/users/search', exports.authMiddleware, async (req, res) => {
             displayName: doc.data().displayName,
             photoURL: doc.data().photoURL,
         }))
-            .filter((user) => {
+            .filter((u) => {
             var _a, _b;
-            return ((_a = user.email) === null || _a === void 0 ? void 0 : _a.toLowerCase().includes(query)) ||
-                ((_b = user.displayName) === null || _b === void 0 ? void 0 : _b.toLowerCase().includes(query));
+            return ((_a = u.email) === null || _a === void 0 ? void 0 : _a.toLowerCase().includes(q)) ||
+                ((_b = u.displayName) === null || _b === void 0 ? void 0 : _b.toLowerCase().includes(q));
         });
         res.json({ users });
     }
@@ -1012,23 +974,79 @@ app.get('/api/users/search', exports.authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.get('/health', (req, res) => {
+/** ---------- SESSION AUTH (no authMiddleware here) ---------- */
+app.post('/auth/sessionLogin', async (req, res) => {
+    try {
+        const { idToken } = (req.body || {});
+        if (!idToken) {
+            res.status(400).json({ error: 'idToken required' });
+            return;
+        }
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        const expiresInMs = 5 * 24 * 60 * 60 * 1000; // 5 days
+        const sessionCookie = await admin.auth().createSessionCookie(idToken, {
+            expiresIn: expiresInMs,
+        });
+        const isLocal = process.env.FUNCTIONS_EMULATOR === 'true' || !!process.env.FIREBASE_EMULATOR_HUB;
+        res.cookie('__session', sessionCookie, {
+            httpOnly: true,
+            secure: !isLocal, // must be true for SameSite=None in prod
+            sameSite: isLocal ? 'lax' : 'none',
+            path: '/',
+            maxAge: Math.floor(expiresInMs / 1000),
+        });
+        res.json({ status: 'ok', uid: decoded.uid });
+        return;
+    }
+    catch (e) {
+        console.error('sessionLogin error', e);
+        res.status(401).json({ error: 'Invalid idToken' });
+        return;
+    }
+});
+app.post('/auth/sessionLogout', async (req, res) => {
+    var _a;
+    try {
+        const cookie = (_a = req.cookies) === null || _a === void 0 ? void 0 : _a.__session;
+        if (cookie) {
+            try {
+                const decoded = await admin.auth().verifySessionCookie(cookie, true);
+                await admin.auth().revokeRefreshTokens(decoded.sub);
+            }
+            catch (_b) {
+                // ignore
+            }
+        }
+    }
+    finally {
+        res.clearCookie('__session', { path: '/' });
+        res.json({ status: 'signedOut' });
+    }
+});
+/** ---------- HEALTH & ERRORS ---------- */
+app.get('/health', (_req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
         service: 'Production Company Management API',
     });
 });
-app.use((req, res) => {
+app.use((_req, res) => {
     res.status(404).json({ error: 'Not found' });
 });
-app.use((err, req, res, next) => {
+app.use((err, _req, res, _next) => {
     console.error('Unhandled error:', err);
     res.status(500).json({ error: 'Internal server error' });
 });
-exports.api = (0, https_1.onRequest)(app);
+/** ---------- EXPORTS ---------- */
+// Mount both at root and /api (so dev proxy or Hosting rewrite both work)
+const root = (0, express_1.default)();
+root.use(app); // "/dashboard", "/health", etc.
+root.use('/api', app); // "/api/dashboard", "/api/health", etc.
+exports.api = (0, https_1.onRequest)(root);
+/** ---------- SCHEDULED JOBS ---------- */
 exports.checkOverdueInvoices = (0, scheduler_1.onSchedule)('0 9 * * *', async () => {
-    var _a;
+    var _a, _b;
     console.log('Checking for overdue invoices...');
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -1040,10 +1058,9 @@ exports.checkOverdueInvoices = (0, scheduler_1.onSchedule)('0 9 * * *', async ()
             .get();
         const batch = db.batch();
         for (const invoiceDoc of invoicesSnapshot.docs) {
-            const dueDate = (_a = invoiceDoc.data().dueDate) === null || _a === void 0 ? void 0 : _a.toDate();
-            if (dueDate && dueDate < today) {
+            const dueDate = (_b = (_a = invoiceDoc.data().dueDate) === null || _a === void 0 ? void 0 : _a.toDate) === null || _b === void 0 ? void 0 : _b.call(_a);
+            if (dueDate && dueDate < today)
                 batch.update(invoiceDoc.ref, { status: 'overdue' });
-            }
         }
         await batch.commit();
     }
@@ -1053,7 +1070,8 @@ exports.checkEquipmentMaintenance = (0, scheduler_1.onSchedule)('0 8 * * 1', asy
     console.log('Checking equipment maintenance schedules...');
     const oneWeekFromNow = new Date();
     oneWeekFromNow.setDate(oneWeekFromNow.getDate() + 7);
-    const equipmentSnapshot = await db.collection('equipment')
+    const equipmentSnapshot = await db
+        .collection('equipment')
         .where('nextMaintenance', '<=', oneWeekFromNow)
         .where('status', '!=', 'Maintenance')
         .get();

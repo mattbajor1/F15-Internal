@@ -5,88 +5,101 @@ import { setGlobalOptions } from 'firebase-functions/v2';
 import * as admin from 'firebase-admin';
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 
-// Set global options for all functions
+// ---------- Functions config ----------
 setGlobalOptions({ maxInstances: 10 });
 
 admin.initializeApp();
 const db = admin.firestore();
 const storage = admin.storage();
 
+// ---------- App + middleware ----------
 const app = express();
 
-app.use(cors({ origin: true }));
+// Allow credentialed CORS (cookies)
+app.use(cors({ origin: true, credentials: true }));
+app.use(cookieParser());
 app.use(express.json());
+app.options('*', cors({ origin: true, credentials: true })); // preflight
 
-app.use((req: Request, res: Response, next: NextFunction) => {
+// Request logging (useful during dev)
+app.use((req: Request, _res: Response, next: NextFunction) => {
   console.log(`${req.method} ${req.path}`, {
-    body: req.body,
-    user: (req as any).user?.uid,
+    hasBody: !!req.body && Object.keys(req.body).length > 0,
   });
   next();
 });
 
+/** ---------- AUTH ---------- */
 export const authMiddleware = async (
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      res.status(401).json({ error: 'Unauthorized: No token provided' });
-      return;
+    // 1) Try Firebase session cookie
+    const sessionCookie = (req as any).cookies?.__session;
+    if (sessionCookie) {
+      const decoded = await admin.auth().verifySessionCookie(sessionCookie, true);
+      (req as any).user = { uid: decoded.uid, email: decoded.email };
+      return next();
     }
 
-    const token = authHeader.split('Bearer ')[1];
-    const decodedToken = await admin.auth().verifyIdToken(token);
-
-    (req as any).user = {
-      uid: decodedToken.uid,
-      email: decodedToken.email,
-    };
-
+    // 2) Fallback to Bearer token
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Unauthorized: No session or token' });
+      return;
+    }
+    const token = authHeader.slice('Bearer '.length);
+    const decoded = await admin.auth().verifyIdToken(token);
+    (req as any).user = { uid: decoded.uid, email: decoded.email };
     next();
-  } catch (error) {
-    console.error('Auth error:', error);
-    res.status(401).json({ error: 'Unauthorized: Invalid token' });
+  } catch (err) {
+    console.error('Auth error:', err);
+    res.status(401).json({ error: 'Unauthorized: Invalid auth' });
   }
 };
 
+// Membership helpers (used by routes)
 async function isProjectMember(projectId: string, userId: string): Promise<boolean> {
   const projectDoc = await db.collection('projects').doc(projectId).get();
   if (!projectDoc.exists) return false;
-
-  const data = projectDoc.data()!;
-  return data.teamMembers?.some((member: any) => member.userId === userId) || false;
+  const data = projectDoc.data() as any;
+  if (Array.isArray(data?.teamMemberIds)) return data.teamMemberIds.includes(userId);
+  return Array.isArray(data?.teamMembers)
+    ? data.teamMembers.some((m: any) => m?.userId === userId)
+    : false;
 }
 
 async function isProjectOwner(projectId: string, userId: string): Promise<boolean> {
   const projectDoc = await db.collection('projects').doc(projectId).get();
   if (!projectDoc.exists) return false;
-
-  const data = projectDoc.data()!;
-  return data.ownerId === userId;
+  const data = projectDoc.data() as any;
+  return data?.ownerId === userId;
 }
 
-app.get('/api/dashboard', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- DASHBOARD ---------- */
+app.get('/dashboard', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
 
-    const projectsSnapshot = await db.collection('projects')
-      .where('teamMembers', 'array-contains-any', [{ userId: uid }])
+    const projectsSnapshot = await db
+      .collection('projects')
+      .where('teamMemberIds', 'array-contains', uid)
       .get();
 
     const projectIds = projectsSnapshot.docs.map((doc) => doc.id);
 
     const activeProjects = projectsSnapshot.docs.filter(
-      (doc) => doc.data().status === 'active'
+      (doc) => (doc.data() as any).status === 'active'
     ).length;
 
     let openTasks = 0;
     for (const projectId of projectIds) {
-      const tasksSnapshot = await db.collection('projects')
+      const tasksSnapshot = await db
+        .collection('projects')
         .doc(projectId)
         .collection('tasks')
         .where('completed', '==', false)
@@ -97,30 +110,22 @@ app.get('/api/dashboard', authMiddleware, async (req: Request, res: Response): P
     const equipmentSnapshot = await db.collection('equipment').get();
     const totalEquipment = equipmentSnapshot.size;
     const availableEquipment = equipmentSnapshot.docs.filter(
-      (doc) => doc.data().status === 'Available'
+      (doc) => (doc.data() as any).status === 'Available'
     ).length;
-    const equipmentAvailability = totalEquipment > 0
-      ? Math.round((availableEquipment / totalEquipment) * 100)
-      : 0;
+    const equipmentAvailability =
+      totalEquipment > 0 ? Math.round((availableEquipment / totalEquipment) * 100) : 0;
 
     const recentProjects = projectsSnapshot.docs
       .sort((a, b) => {
-        const aDate = a.data().updatedAt?.toDate() || new Date(0);
-        const bDate = b.data().updatedAt?.toDate() || new Date(0);
+        const aDate = (a.data() as any).updatedAt?.toDate?.() || new Date(0);
+        const bDate = (b.data() as any).updatedAt?.toDate?.() || new Date(0);
         return bDate.getTime() - aDate.getTime();
       })
       .slice(0, 5)
-      .map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      }));
+      .map((doc) => ({ id: doc.id, ...(doc.data() as any) }));
 
     res.json({
-      metrics: {
-        activeProjects,
-        openTasks,
-        equipmentAvailability,
-      },
+      metrics: { activeProjects, openTasks, equipmentAvailability },
       recentProjects,
     });
   } catch (error) {
@@ -129,18 +134,20 @@ app.get('/api/dashboard', authMiddleware, async (req: Request, res: Response): P
   }
 });
 
-app.get('/api/projects', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- PROJECTS ---------- */
+app.get('/projects', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
 
-    const projectsSnapshot = await db.collection('projects')
-      .where('teamMembers', 'array-contains-any', [{ userId: uid }])
+    const projectsSnapshot = await db
+      .collection('projects')
+      .where('teamMemberIds', 'array-contains', uid)
       .orderBy('createdAt', 'desc')
       .get();
 
     const projects = projectsSnapshot.docs.map((doc) => ({
       id: doc.id,
-      ...doc.data(),
+      ...(doc.data() as any),
     }));
 
     res.json({ projects });
@@ -150,10 +157,10 @@ app.get('/api/projects', authMiddleware, async (req: Request, res: Response): Pr
   }
 });
 
-app.post('/api/projects', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
-    const { name, description, status, startDate, endDate, locations } = req.body;
+    const { name, description, status, startDate, endDate, locations } = req.body || {};
 
     if (!name) {
       res.status(400).json({ error: 'Project name is required' });
@@ -161,7 +168,7 @@ app.post('/api/projects', authMiddleware, async (req: Request, res: Response): P
     }
 
     const userDoc = await db.collection('users').doc(uid).get();
-    const userData = userDoc.data();
+    const userData = userDoc.data() as any;
 
     const newProject = {
       name,
@@ -171,12 +178,15 @@ app.post('/api/projects', authMiddleware, async (req: Request, res: Response): P
       endDate: endDate || null,
       locations: locations || [],
       ownerId: uid,
-      teamMembers: [{
-        userId: uid,
-        role: 'Owner',
-        name: userData?.displayName || userData?.email || 'Unknown',
-        avatar: userData?.photoURL || null,
-      }],
+      teamMembers: [
+        {
+          userId: uid,
+          role: 'Owner',
+          name: userData?.displayName || userData?.email || 'Unknown',
+          avatar: userData?.photoURL || null,
+        },
+      ],
+      teamMemberIds: [uid], // for queries
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -195,49 +205,48 @@ app.post('/api/projects', authMiddleware, async (req: Request, res: Response): P
   }
 });
 
-app.get('/api/projects/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.get('/projects/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
     const projectDoc = await db.collection('projects').doc(projectId).get();
-
     if (!projectDoc.exists) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
 
-    res.json({
-      id: projectDoc.id,
-      ...projectDoc.data(),
-    });
+    res.json({ id: projectDoc.id, ...(projectDoc.data() as any) });
   } catch (error) {
     console.error('Get project error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.patch('/api/projects/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.patch('/projects/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
 
-    if (!await isProjectOwner(projectId, uid)) {
+    if (!(await isProjectOwner(projectId, uid))) {
       res.status(403).json({ error: 'Only project owner can update' });
       return;
     }
 
-    const updates = req.body;
+    const updates: any = { ...(req.body || {}) };
     delete updates.ownerId;
     delete updates.createdAt;
 
-    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+    if (Array.isArray(updates.teamMembers)) {
+      updates.teamMemberIds = updates.teamMembers.map((m: any) => m?.userId).filter(Boolean);
+    }
 
+    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
     await db.collection('projects').doc(projectId).update(updates);
 
     res.json({ success: true });
@@ -247,28 +256,22 @@ app.patch('/api/projects/:id', authMiddleware, async (req: Request, res: Respons
   }
 });
 
-app.delete('/api/projects/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.delete('/projects/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
 
-    if (!await isProjectOwner(projectId, uid)) {
+    if (!(await isProjectOwner(projectId, uid))) {
       res.status(403).json({ error: 'Only project owner can delete' });
       return;
     }
 
     const batch = db.batch();
+    const collections = ['tasks', 'equipment', 'marketing', 'invoices', 'documents'] as const;
 
-    const collections = ['tasks', 'equipment', 'marketing', 'invoices', 'documents'];
     for (const collectionName of collections) {
-      const snapshot = await db.collection('projects')
-        .doc(projectId)
-        .collection(collectionName)
-        .get();
-
-      snapshot.docs.forEach((doc) => {
-        batch.delete(doc.ref);
-      });
+      const snapshot = await db.collection('projects').doc(projectId).collection(collectionName).get();
+      snapshot.docs.forEach((doc) => batch.delete(doc.ref));
     }
 
     batch.delete(db.collection('projects').doc(projectId));
@@ -281,29 +284,33 @@ app.delete('/api/projects/:id', authMiddleware, async (req: Request, res: Respon
   }
 });
 
-app.post('/api/projects/:id/team', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects/:id/team', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
-    const { userId, role, name, avatar } = req.body;
+    const { userId, role, name, avatar } = req.body || {};
 
-    if (!await isProjectOwner(projectId, uid)) {
+    if (!(await isProjectOwner(projectId, uid))) {
       res.status(403).json({ error: 'Only project owner can add members' });
       return;
     }
 
-    const projectDoc = await db.collection('projects').doc(projectId).get();
-    const teamMembers = projectDoc.data()?.teamMembers || [];
+    const projectRef = db.collection('projects').doc(projectId);
+    const projectDoc = await projectRef.get();
+    const teamMembers: any[] = (projectDoc.data()?.teamMembers || []) as any[];
+    const teamMemberIds: string[] = (projectDoc.data()?.teamMemberIds || []) as string[];
 
-    if (teamMembers.some((m: any) => m.userId === userId)) {
+    if (teamMembers.some((m: any) => m?.userId === userId)) {
       res.status(400).json({ error: 'User already in team' });
       return;
     }
 
     teamMembers.push({ userId, role, name, avatar: avatar || null });
+    teamMemberIds.push(userId);
 
-    await db.collection('projects').doc(projectId).update({
+    await projectRef.update({
       teamMembers,
+      teamMemberIds,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -314,30 +321,36 @@ app.post('/api/projects/:id/team', authMiddleware, async (req: Request, res: Res
   }
 });
 
-app.delete('/api/projects/:id/team/:userId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.delete('/projects/:id/team/:userId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
     const userIdToRemove = req.params.userId;
 
-    if (!await isProjectOwner(projectId, uid)) {
+    if (!(await isProjectOwner(projectId, uid))) {
       res.status(403).json({ error: 'Only project owner can remove members' });
       return;
     }
 
-    const projectDoc = await db.collection('projects').doc(projectId).get();
-    const ownerId = projectDoc.data()?.ownerId;
+    const projectRef = db.collection('projects').doc(projectId);
+    const projectDoc = await projectRef.get();
+    const ownerId = (projectDoc.data() as any)?.ownerId;
 
     if (userIdToRemove === ownerId) {
       res.status(400).json({ error: 'Cannot remove project owner' });
       return;
     }
 
-    const teamMembers = projectDoc.data()?.teamMembers || [];
-    const updatedTeam = teamMembers.filter((m: any) => m.userId !== userIdToRemove);
+    const teamMembers = ((projectDoc.data() as any)?.teamMembers || []).filter(
+      (m: any) => m?.userId !== userIdToRemove
+    );
+    const teamMemberIds = ((projectDoc.data() as any)?.teamMemberIds || []).filter(
+      (id: string) => id !== userIdToRemove
+    );
 
-    await db.collection('projects').doc(projectId).update({
-      teamMembers: updatedTeam,
+    await projectRef.update({
+      teamMembers,
+      teamMemberIds,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -348,27 +361,25 @@ app.delete('/api/projects/:id/team/:userId', authMiddleware, async (req: Request
   }
 });
 
-app.get('/api/projects/:id/tasks', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- TASKS ---------- */
+app.get('/projects/:id/tasks', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const tasksSnapshot = await db.collection('projects')
+    const tasksSnapshot = await db
+      .collection('projects')
       .doc(projectId)
       .collection('tasks')
       .orderBy('dueDate', 'asc')
       .get();
 
-    const tasks = tasksSnapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
+    const tasks = tasksSnapshot.docs.map((doc) => ({ id: doc.id, ...(doc.data() as any) }));
     res.json({ tasks });
   } catch (error) {
     console.error('List tasks error:', error);
@@ -376,17 +387,16 @@ app.get('/api/projects/:id/tasks', authMiddleware, async (req: Request, res: Res
   }
 });
 
-app.post('/api/projects/:id/tasks', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects/:id/tasks', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
-    const { title, description, stage, dueDate, assignedTo } = req.body;
+    const { title, description, stage, dueDate, assignedTo } = req.body || {};
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
-
     if (!title || !stage) {
       res.status(400).json({ error: 'Title and stage are required' });
       return;
@@ -403,10 +413,7 @@ app.post('/api/projects/:id/tasks', authMiddleware, async (req: Request, res: Re
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    const docRef = await db.collection('projects')
-      .doc(projectId)
-      .collection('tasks')
-      .add(newTask);
+    const docRef = await db.collection('projects').doc(projectId).collection('tasks').add(newTask);
 
     res.status(201).json({
       id: docRef.id,
@@ -420,25 +427,20 @@ app.post('/api/projects/:id/tasks', authMiddleware, async (req: Request, res: Re
   }
 });
 
-app.patch('/api/projects/:projectId/tasks/:taskId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.patch('/projects/:projectId/tasks/:taskId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, taskId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const updates = req.body;
+    const updates: any = { ...(req.body || {}) };
     updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
 
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('tasks')
-      .doc(taskId)
-      .update(updates);
-
+    await db.collection('projects').doc(projectId).collection('tasks').doc(taskId).update(updates);
     res.json({ success: true });
   } catch (error) {
     console.error('Update task error:', error);
@@ -446,22 +448,17 @@ app.patch('/api/projects/:projectId/tasks/:taskId', authMiddleware, async (req: 
   }
 });
 
-app.delete('/api/projects/:projectId/tasks/:taskId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.delete('/projects/:projectId/tasks/:taskId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, taskId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('tasks')
-      .doc(taskId)
-      .delete();
-
+    await db.collection('projects').doc(projectId).collection('tasks').doc(taskId).delete();
     res.json({ success: true });
   } catch (error) {
     console.error('Delete task error:', error);
@@ -469,26 +466,19 @@ app.delete('/api/projects/:projectId/tasks/:taskId', authMiddleware, async (req:
   }
 });
 
-app.get('/api/projects/:id/equipment', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- EQUIPMENT (per project + global) ---------- */
+app.get('/projects/:id/equipment', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const equipmentSnapshot = await db.collection('projects')
-      .doc(projectId)
-      .collection('equipment')
-      .get();
-
-    const equipment = equipmentSnapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
+    const snap = await db.collection('projects').doc(projectId).collection('equipment').get();
+    const equipment = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
     res.json({ equipment });
   } catch (error) {
     console.error('List equipment error:', error);
@@ -496,13 +486,13 @@ app.get('/api/projects/:id/equipment', authMiddleware, async (req: Request, res:
   }
 });
 
-app.post('/api/projects/:id/equipment', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects/:id/equipment', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
-    const { equipmentId, rentalPrice, notes } = req.body;
+    const { equipmentId, rentalPrice, notes } = req.body || {};
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -513,7 +503,7 @@ app.post('/api/projects/:id/equipment', authMiddleware, async (req: Request, res
       return;
     }
 
-    const equipmentData = equipmentDoc.data()!;
+    const equipmentData = equipmentDoc.data() as any;
 
     const assignment = {
       equipmentId,
@@ -524,11 +514,7 @@ app.post('/api/projects/:id/equipment', authMiddleware, async (req: Request, res
       assignedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    const docRef = await db.collection('projects')
-      .doc(projectId)
-      .collection('equipment')
-      .add(assignment);
-
+    const docRef = await db.collection('projects').doc(projectId).collection('equipment').add(assignment);
     await db.collection('equipment').doc(equipmentId).update({
       status: 'In Use',
       currentProjectId: projectId,
@@ -545,37 +531,26 @@ app.post('/api/projects/:id/equipment', authMiddleware, async (req: Request, res
   }
 });
 
-app.delete('/api/projects/:projectId/equipment/:assignmentId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.delete('/projects/:projectId/equipment/:assignmentId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, assignmentId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const assignmentDoc = await db.collection('projects')
-      .doc(projectId)
-      .collection('equipment')
-      .doc(assignmentId)
-      .get();
-
+    const assignmentDoc = await db.collection('projects').doc(projectId).collection('equipment').doc(assignmentId).get();
     if (assignmentDoc.exists) {
-      const equipmentId = assignmentDoc.data()?.equipmentId;
-
+      const equipmentId = (assignmentDoc.data() as any)?.equipmentId;
       await db.collection('equipment').doc(equipmentId).update({
         status: 'Available',
         currentProjectId: null,
       });
     }
 
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('equipment')
-      .doc(assignmentId)
-      .delete();
-
+    await db.collection('projects').doc(projectId).collection('equipment').doc(assignmentId).delete();
     res.json({ success: true });
   } catch (error) {
     console.error('Remove equipment error:', error);
@@ -583,27 +558,25 @@ app.delete('/api/projects/:projectId/equipment/:assignmentId', authMiddleware, a
   }
 });
 
-app.get('/api/projects/:id/marketing', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- MARKETING ---------- */
+app.get('/projects/:id/marketing', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const marketingSnapshot = await db.collection('projects')
+    const marketingSnapshot = await db
+      .collection('projects')
       .doc(projectId)
       .collection('marketing')
       .orderBy('scheduledDate', 'desc')
       .get();
 
-    const marketing = marketingSnapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
+    const marketing = marketingSnapshot.docs.map((doc) => ({ id: doc.id, ...(doc.data() as any) }));
     res.json({ marketing });
   } catch (error) {
     console.error('List marketing error:', error);
@@ -611,18 +584,17 @@ app.get('/api/projects/:id/marketing', authMiddleware, async (req: Request, res:
   }
 });
 
-app.post('/api/projects/:id/marketing', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects/:id/marketing', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
-    const { copy, platforms, status, scheduledDate, imageUrl } = req.body;
+    const { copy, platforms, status, scheduledDate, imageUrl } = req.body || {};
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
-
-    if (!copy || !platforms || platforms.length === 0) {
+    if (!copy || !Array.isArray(platforms) || platforms.length === 0) {
       res.status(400).json({ error: 'Copy and platforms are required' });
       return;
     }
@@ -638,10 +610,7 @@ app.post('/api/projects/:id/marketing', authMiddleware, async (req: Request, res
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    const docRef = await db.collection('projects')
-      .doc(projectId)
-      .collection('marketing')
-      .add(newContent);
+    const docRef = await db.collection('projects').doc(projectId).collection('marketing').add(newContent);
 
     res.status(201).json({
       id: docRef.id,
@@ -655,25 +624,18 @@ app.post('/api/projects/:id/marketing', authMiddleware, async (req: Request, res
   }
 });
 
-app.patch('/api/projects/:projectId/marketing/:marketingId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.patch('/projects/:projectId/marketing/:marketingId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, marketingId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const updates = req.body;
-    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('marketing')
-      .doc(marketingId)
-      .update(updates);
-
+    const updates: any = { ...(req.body || {}), updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    await db.collection('projects').doc(projectId).collection('marketing').doc(marketingId).update(updates);
     res.json({ success: true });
   } catch (error) {
     console.error('Update marketing error:', error);
@@ -681,22 +643,17 @@ app.patch('/api/projects/:projectId/marketing/:marketingId', authMiddleware, asy
   }
 });
 
-app.delete('/api/projects/:projectId/marketing/:marketingId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.delete('/projects/:projectId/marketing/:marketingId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, marketingId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('marketing')
-      .doc(marketingId)
-      .delete();
-
+    await db.collection('projects').doc(projectId).collection('marketing').doc(marketingId).delete();
     res.json({ success: true });
   } catch (error) {
     console.error('Delete marketing error:', error);
@@ -704,13 +661,13 @@ app.delete('/api/projects/:projectId/marketing/:marketingId', authMiddleware, as
   }
 });
 
-app.post('/api/projects/:id/marketing/generate', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects/:id/marketing/generate', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
-    const { projectDetails, targetAudience, campaignGoals, tone } = req.body;
+    const { projectDetails, targetAudience, campaignGoals, tone } = req.body || {};
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -736,27 +693,25 @@ app.post('/api/projects/:id/marketing/generate', authMiddleware, async (req: Req
   }
 });
 
-app.get('/api/projects/:id/invoices', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- INVOICES ---------- */
+app.get('/projects/:id/invoices', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const invoicesSnapshot = await db.collection('projects')
+    const invoicesSnapshot = await db
+      .collection('projects')
       .doc(projectId)
       .collection('invoices')
       .orderBy('dueDate', 'desc')
       .get();
 
-    const invoices = invoicesSnapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
+    const invoices = invoicesSnapshot.docs.map((doc) => ({ id: doc.id, ...(doc.data() as any) }));
     res.json({ invoices });
   } catch (error) {
     console.error('List invoices error:', error);
@@ -764,17 +719,16 @@ app.get('/api/projects/:id/invoices', authMiddleware, async (req: Request, res: 
   }
 });
 
-app.post('/api/projects/:id/invoices', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects/:id/invoices', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
-    const { invoiceNumber, clientName, amount, status, dueDate, items } = req.body;
+    const { invoiceNumber, clientName, amount, status, dueDate, items } = req.body || {};
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
-
     if (!invoiceNumber || !amount) {
       res.status(400).json({ error: 'Invoice number and amount are required' });
       return;
@@ -792,10 +746,7 @@ app.post('/api/projects/:id/invoices', authMiddleware, async (req: Request, res:
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    const docRef = await db.collection('projects')
-      .doc(projectId)
-      .collection('invoices')
-      .add(newInvoice);
+    const docRef = await db.collection('projects').doc(projectId).collection('invoices').add(newInvoice);
 
     res.status(201).json({
       id: docRef.id,
@@ -809,25 +760,18 @@ app.post('/api/projects/:id/invoices', authMiddleware, async (req: Request, res:
   }
 });
 
-app.patch('/api/projects/:projectId/invoices/:invoiceId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.patch('/projects/:projectId/invoices/:invoiceId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, invoiceId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const updates = req.body;
-    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('invoices')
-      .doc(invoiceId)
-      .update(updates);
-
+    const updates: any = { ...(req.body || {}), updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    await db.collection('projects').doc(projectId).collection('invoices').doc(invoiceId).update(updates);
     res.json({ success: true });
   } catch (error) {
     console.error('Update invoice error:', error);
@@ -835,22 +779,17 @@ app.patch('/api/projects/:projectId/invoices/:invoiceId', authMiddleware, async 
   }
 });
 
-app.delete('/api/projects/:projectId/invoices/:invoiceId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.delete('/projects/:projectId/invoices/:invoiceId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, invoiceId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('invoices')
-      .doc(invoiceId)
-      .delete();
-
+    await db.collection('projects').doc(projectId).collection('invoices').doc(invoiceId).delete();
     res.json({ success: true });
   } catch (error) {
     console.error('Delete invoice error:', error);
@@ -858,27 +797,25 @@ app.delete('/api/projects/:projectId/invoices/:invoiceId', authMiddleware, async
   }
 });
 
-app.get('/api/projects/:id/documents', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- DOCUMENTS ---------- */
+app.get('/projects/:id/documents', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const documentsSnapshot = await db.collection('projects')
+    const documentsSnapshot = await db
+      .collection('projects')
       .doc(projectId)
       .collection('documents')
       .orderBy('uploadedAt', 'desc')
       .get();
 
-    const documents = documentsSnapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
+    const documents = documentsSnapshot.docs.map((doc) => ({ id: doc.id, ...(doc.data() as any) }));
     res.json({ documents });
   } catch (error) {
     console.error('List documents error:', error);
@@ -886,17 +823,16 @@ app.get('/api/projects/:id/documents', authMiddleware, async (req: Request, res:
   }
 });
 
-app.post('/api/projects/:id/documents', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects/:id/documents', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
-    const { name, fileUrl, fileSize, mimeType, version, accessPermissions } = req.body;
+    const { name, fileUrl, fileSize, mimeType, version, accessPermissions } = req.body || {};
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
-
     if (!name || !fileUrl) {
       res.status(400).json({ error: 'Name and file URL are required' });
       return;
@@ -914,10 +850,7 @@ app.post('/api/projects/:id/documents', authMiddleware, async (req: Request, res
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    const docRef = await db.collection('projects')
-      .doc(projectId)
-      .collection('documents')
-      .add(newDocument);
+    const docRef = await db.collection('projects').doc(projectId).collection('documents').add(newDocument);
 
     res.status(201).json({
       id: docRef.id,
@@ -931,25 +864,18 @@ app.post('/api/projects/:id/documents', authMiddleware, async (req: Request, res
   }
 });
 
-app.patch('/api/projects/:projectId/documents/:documentId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.patch('/projects/:projectId/documents/:documentId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, documentId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const updates = req.body;
-    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('documents')
-      .doc(documentId)
-      .update(updates);
-
+    const updates: any = { ...(req.body || {}), updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    await db.collection('projects').doc(projectId).collection('documents').doc(documentId).update(updates);
     res.json({ success: true });
   } catch (error) {
     console.error('Update document error:', error);
@@ -957,25 +883,20 @@ app.patch('/api/projects/:projectId/documents/:documentId', authMiddleware, asyn
   }
 });
 
-app.delete('/api/projects/:projectId/documents/:documentId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.delete('/projects/:projectId/documents/:documentId', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const { projectId, documentId } = req.params;
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
 
-    const docSnapshot = await db.collection('projects')
-      .doc(projectId)
-      .collection('documents')
-      .doc(documentId)
-      .get();
+    const docSnapshot = await db.collection('projects').doc(projectId).collection('documents').doc(documentId).get();
 
     if (docSnapshot.exists) {
-      const fileUrl = docSnapshot.data()?.fileUrl;
-
+      const fileUrl = (docSnapshot.data() as any)?.fileUrl;
       if (fileUrl && fileUrl.includes('firebasestorage.googleapis.com')) {
         try {
           const pathMatch = fileUrl.match(/\/o\/(.+?)\?/);
@@ -989,12 +910,7 @@ app.delete('/api/projects/:projectId/documents/:documentId', authMiddleware, asy
       }
     }
 
-    await db.collection('projects')
-      .doc(projectId)
-      .collection('documents')
-      .doc(documentId)
-      .delete();
-
+    await db.collection('projects').doc(projectId).collection('documents').doc(documentId).delete();
     res.json({ success: true });
   } catch (error) {
     console.error('Delete document error:', error);
@@ -1002,13 +918,13 @@ app.delete('/api/projects/:projectId/documents/:documentId', authMiddleware, asy
   }
 });
 
-app.post('/api/projects/:id/documents/upload-url', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/projects/:id/documents/upload-url', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const projectId = req.params.id;
-    const { fileName, contentType } = req.body;
+    const { fileName, contentType } = req.body || {};
 
-    if (!await isProjectMember(projectId, uid)) {
+    if (!(await isProjectMember(projectId, uid))) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -1036,17 +952,11 @@ app.post('/api/projects/:id/documents/upload-url', authMiddleware, async (req: R
   }
 });
 
-app.get('/api/equipment', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- GLOBAL EQUIPMENT ---------- */
+app.get('/equipment', authMiddleware, async (_req: Request, res: Response): Promise<void> => {
   try {
-    const equipmentSnapshot = await db.collection('equipment')
-      .orderBy('name', 'asc')
-      .get();
-
-    const equipment = equipmentSnapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
+    const equipmentSnapshot = await db.collection('equipment').orderBy('name', 'asc').get();
+    const equipment = equipmentSnapshot.docs.map((doc) => ({ id: doc.id, ...(doc.data() as any) }));
     res.json({ equipment });
   } catch (error) {
     console.error('List equipment error:', error);
@@ -1054,34 +964,27 @@ app.get('/api/equipment', authMiddleware, async (req: Request, res: Response): P
   }
 });
 
-app.get('/api/equipment/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.get('/equipment/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const equipmentDoc = await db.collection('equipment').doc(req.params.id).get();
-
     if (!equipmentDoc.exists) {
       res.status(404).json({ error: 'Equipment not found' });
       return;
     }
-
-    res.json({
-      id: equipmentDoc.id,
-      ...equipmentDoc.data(),
-    });
+    res.json({ id: equipmentDoc.id, ...(equipmentDoc.data() as any) });
   } catch (error) {
     console.error('Get equipment error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/equipment', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.post('/equipment', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { name, category, status, nextMaintenance, purchaseDate, purchasePrice } = req.body;
-
+    const { name, category, status, nextMaintenance, purchaseDate, purchasePrice } = req.body || {};
     if (!name || !category) {
       res.status(400).json({ error: 'Name and category are required' });
       return;
     }
-
     const newEquipment = {
       name,
       category,
@@ -1093,9 +996,7 @@ app.post('/api/equipment', authMiddleware, async (req: Request, res: Response): 
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
-
     const docRef = await db.collection('equipment').add(newEquipment);
-
     res.status(201).json({
       id: docRef.id,
       ...newEquipment,
@@ -1108,13 +1009,10 @@ app.post('/api/equipment', authMiddleware, async (req: Request, res: Response): 
   }
 });
 
-app.patch('/api/equipment/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.patch('/equipment/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
-    const updates = req.body;
-    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-
+    const updates: any = { ...(req.body || {}), updatedAt: admin.firestore.FieldValue.serverTimestamp() };
     await db.collection('equipment').doc(req.params.id).update(updates);
-
     res.json({ success: true });
   } catch (error) {
     console.error('Update equipment error:', error);
@@ -1122,7 +1020,7 @@ app.patch('/api/equipment/:id', authMiddleware, async (req: Request, res: Respon
   }
 });
 
-app.delete('/api/equipment/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.delete('/equipment/:id', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     await db.collection('equipment').doc(req.params.id).delete();
     res.json({ success: true });
@@ -1132,36 +1030,29 @@ app.delete('/api/equipment/:id', authMiddleware, async (req: Request, res: Respo
   }
 });
 
-app.get('/api/me', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+/** ---------- PROFILE ---------- */
+app.get('/me', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
     const userDoc = await db.collection('users').doc(uid).get();
-
     if (!userDoc.exists) {
       res.status(404).json({ error: 'User profile not found' });
       return;
     }
-
-    res.json({
-      id: userDoc.id,
-      ...userDoc.data(),
-    });
+    res.json({ id: userDoc.id, ...(userDoc.data() as any) });
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.patch('/api/me', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.patch('/me', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
     const uid = (req as any).user.uid;
-    const updates = req.body;
-
+    const updates: any = { ...(req.body || {}) };
     delete updates.email;
     updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-
     await db.collection('users').doc(uid).set(updates, { merge: true });
-
     res.json({ success: true });
   } catch (error) {
     console.error('Update user error:', error);
@@ -1169,30 +1060,26 @@ app.patch('/api/me', authMiddleware, async (req: Request, res: Response): Promis
   }
 });
 
-app.get('/api/users/search', authMiddleware, async (req: Request, res: Response): Promise<void> => {
+app.get('/users/search', authMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
-    const query = (req.query.q as string || '').toLowerCase();
-
-    if (!query || query.length < 2) {
+    const q = (req.query.q as string | undefined)?.toLowerCase() || '';
+    if (q.length < 2) {
       res.status(400).json({ error: 'Query must be at least 2 characters' });
       return;
     }
 
-    const usersSnapshot = await db.collection('users')
-      .orderBy('email')
-      .limit(20)
-      .get();
-
+    const usersSnapshot = await db.collection('users').orderBy('email').limit(20).get();
     const users = usersSnapshot.docs
       .map((doc) => ({
         id: doc.id,
-        email: doc.data().email,
-        displayName: doc.data().displayName,
-        photoURL: doc.data().photoURL,
+        email: (doc.data() as any).email,
+        displayName: (doc.data() as any).displayName,
+        photoURL: (doc.data() as any).photoURL,
       }))
-      .filter((user) =>
-        user.email?.toLowerCase().includes(query) ||
-        user.displayName?.toLowerCase().includes(query)
+      .filter(
+        (u) =>
+          u.email?.toLowerCase().includes(q) ||
+          u.displayName?.toLowerCase().includes(q)
       );
 
     res.json({ users });
@@ -1202,7 +1089,60 @@ app.get('/api/users/search', authMiddleware, async (req: Request, res: Response)
   }
 });
 
-app.get('/health', (req: Request, res: Response) => {
+/** ---------- SESSION AUTH (no authMiddleware here) ---------- */
+app.post('/auth/sessionLogin', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { idToken } = (req.body || {}) as { idToken?: string };
+    if (!idToken) {
+      res.status(400).json({ error: 'idToken required' });
+      return;
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const expiresInMs = 5 * 24 * 60 * 60 * 1000; // 5 days
+
+    const sessionCookie = await admin.auth().createSessionCookie(idToken, {
+      expiresIn: expiresInMs,
+    });
+
+    const isLocal = process.env.FUNCTIONS_EMULATOR === 'true' || !!process.env.FIREBASE_EMULATOR_HUB;
+
+    res.cookie('__session', sessionCookie, {
+      httpOnly: true,
+      secure: !isLocal, // must be true for SameSite=None in prod
+      sameSite: isLocal ? 'lax' : 'none',
+      path: '/',
+      maxAge: Math.floor(expiresInMs / 1000),
+    });
+
+    res.json({ status: 'ok', uid: decoded.uid });
+    return;
+  } catch (e) {
+    console.error('sessionLogin error', e);
+    res.status(401).json({ error: 'Invalid idToken' });
+    return;
+  }
+});
+
+app.post('/auth/sessionLogout', async (req: Request, res: Response) => {
+  try {
+    const cookie = (req as any).cookies?.__session;
+    if (cookie) {
+      try {
+        const decoded = await admin.auth().verifySessionCookie(cookie, true);
+        await admin.auth().revokeRefreshTokens(decoded.sub);
+      } catch {
+        // ignore
+      }
+    }
+  } finally {
+    res.clearCookie('__session', { path: '/' });
+    res.json({ status: 'signedOut' });
+  }
+});
+
+/** ---------- HEALTH & ERRORS ---------- */
+app.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -1210,25 +1150,29 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
-app.use((req: Request, res: Response) => {
+app.use((_req: Request, res: Response) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-export const api = onRequest(app);
+/** ---------- EXPORTS ---------- */
+// Mount both at root and /api (so dev proxy or Hosting rewrite both work)
+const root = express();
+root.use(app);          // "/dashboard", "/health", etc.
+root.use('/api', app);  // "/api/dashboard", "/api/health", etc.
+export const api = onRequest(root);
 
+/** ---------- SCHEDULED JOBS ---------- */
 export const checkOverdueInvoices = onSchedule('0 9 * * *', async () => {
   console.log('Checking for overdue invoices...');
-
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
   const projectsSnapshot = await db.collection('projects').get();
-
   for (const projectDoc of projectsSnapshot.docs) {
     const invoicesSnapshot = await projectDoc.ref
       .collection('invoices')
@@ -1236,36 +1180,29 @@ export const checkOverdueInvoices = onSchedule('0 9 * * *', async () => {
       .get();
 
     const batch = db.batch();
-
     for (const invoiceDoc of invoicesSnapshot.docs) {
-      const dueDate = invoiceDoc.data().dueDate?.toDate();
-
-      if (dueDate && dueDate < today) {
-        batch.update(invoiceDoc.ref, { status: 'overdue' });
-      }
+      const dueDate = (invoiceDoc.data() as any).dueDate?.toDate?.();
+      if (dueDate && dueDate < today) batch.update(invoiceDoc.ref, { status: 'overdue' });
     }
-
     await batch.commit();
   }
-
   console.log('Overdue invoice check complete');
 });
 
 export const checkEquipmentMaintenance = onSchedule('0 8 * * 1', async () => {
   console.log('Checking equipment maintenance schedules...');
-
   const oneWeekFromNow = new Date();
   oneWeekFromNow.setDate(oneWeekFromNow.getDate() + 7);
 
-  const equipmentSnapshot = await db.collection('equipment')
+  const equipmentSnapshot = await db
+    .collection('equipment')
     .where('nextMaintenance', '<=', oneWeekFromNow)
     .where('status', '!=', 'Maintenance')
     .get();
 
   console.log(`Found ${equipmentSnapshot.size} items needing maintenance soon`);
-
   for (const doc of equipmentSnapshot.docs) {
-    const data = doc.data();
+    const data = doc.data() as any;
     console.log(`Maintenance due for: ${data.name} on ${data.nextMaintenance}`);
   }
 });
